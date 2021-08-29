@@ -224,7 +224,7 @@ impl Log {
 
         while size > 0 {
             let len = min(max_chunk, size);
-            let ret : i32;
+            let mut ret : i32 = 0;
             if (self.flags & LOG_DISCARD_NOT_SUPP) <= 0 {
                 ret = self.discard_range(start, len)
             }
@@ -318,7 +318,7 @@ impl Log {
             bail!("Error reading data: {}", ret)
         }
 
-        let offset = entry.sector * self.sector_size;
+        let offset = entry.sector * self.sector_size as u64;
         ret = io::pwrite(&self.replay_file, buf.as_slice(), offset as i64)?;
         drop(buf);
         if ret != size as usize {
