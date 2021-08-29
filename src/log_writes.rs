@@ -281,14 +281,14 @@ impl Log {
             return Ok(None);
         }
 
-        let ret = io::read(&self.log_file, &mut raw_log_entry)?;
+        let mut ret = io::read(&self.log_file, &mut raw_log_entry)?;
         if ret != read_size as usize {
             bail!("Error reading entry: {}", ret)
         }
         let entry = LogWriteEntry::from(raw_log_entry);
         self.cur_entry += 1;
 
-        let size = entry.nr_sectors * self.sector_size as u64;
+        let size = (entry.nr_sectors * self.sector_size as u64) as usize;
         if read_size < self.sector_size as usize {
             self.log_file.seek(SeekFrom::Current(LogWriteEntry::mem_size() as i64))?;
         }
@@ -303,10 +303,28 @@ impl Log {
             return Ok(Some(entry));
         }
 
-        if (flags & LOG_DISCARD_FLAG) != 0 {}
+        if (flags & LOG_DISCARD_FLAG) > 0 {
+            self.discard(&entry);
+            return Ok(Some(entry))
+        }
 
+        let mut buf: Vec<u8> = Vec::with_capacity(size);
+        if buf.capacity() != size {
+            bail!("Error allocating buffer {} entry {}", size, self.cur_entry - 1);
+        }
 
-        todo!()
+        ret = io::read(&self.log_file, &mut buf)?;
+        if ret != size as usize {
+            bail!("Error reading data: {}", ret)
+        }
+
+        let offset = entry.sector * self.sector_size;
+        ret = io::pwrite(&self.replay_file, buf.as_slice(), offset as i64)?;
+        drop(buf);
+        if ret != size as usize {
+            bail!("Error reading data: {}", ret)
+        }
+        Ok(Some(entry))
     }
 }
 
