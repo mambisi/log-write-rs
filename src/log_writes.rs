@@ -8,6 +8,10 @@ use crate::io;
 use crate::util;
 use std::cmp::min;
 use std::os::unix::io::{AsRawFd, RawFd};
+use derivative::Derivative;
+use nix::unistd::Whence;
+use std::string::FromUtf8Error;
+use std::ffi::CString;
 
 pub const LOG_FLUSH_FLAG: u64 = 1 << 0;
 pub const LOG_FUA_FLAG: u64 = 1 << 1;
@@ -32,8 +36,7 @@ impl From<[u8; 32]> for LogWriteSuper {
         let magic = rdr.read_u64_le();
         let version = rdr.read_u64_le();
         let nr_entries = rdr.read_u64_le();
-        let _ = rdr.skip(4);
-        let sector_size = rdr.read_u32_le();
+        let sector_size = rdr.read_u64_le() as u32;
         Self {
             magic,
             version,
@@ -80,27 +83,51 @@ fn log_flags_table() -> Vec<FlagsToStrEntry> {
 }
 
 
-#[derive(Default)]
+#[derive(Debug)]
 pub struct LogWriteEntry {
     pub sector: u64,
     pub nr_sectors: u64,
     pub flags: u64,
     pub data_len: u64,
+    pub cmd : String
 }
 
 impl From<Vec<u8>> for LogWriteEntry {
     fn from(buf: Vec<u8>) -> Self {
-        let mut rdr = Reader::from(buf);
+        let mut buf = buf;
+        let header : Vec<_> = buf.drain(..Self::mem_size()).collect();
+        let mut rdr = Reader::from(header);
         let sector = rdr.read_u64_le();
         let nr_sectors = rdr.read_u64_le();
         let flags = rdr.read_u64_le();
         let data_len = rdr.read_u64_le();
+
+        let mut valid_str = Vec::new();
+
+        for i in buf {
+            if i > 0 {
+                valid_str.push(i)
+            }else {
+                break
+            }
+        }
+        let mut cmd = String::from_utf8(valid_str).unwrap_or_default();
         Self {
             sector,
             nr_sectors,
             flags,
             data_len,
+            cmd
         }
+    }
+}
+// memory size of  sector,nr_sector,flags,data_len)
+//  (8 + 8 + 8 + 8) = 32
+const LOG_WRITE_ENTRY_SIZE : usize = 32;
+
+impl MemSize for LogWriteEntry {
+    fn mem_size() -> usize {
+        LOG_WRITE_ENTRY_SIZE
     }
 }
 
@@ -108,8 +135,12 @@ pub const LOG_IGNORE_DISCARD: u64 = 1 << 0;
 pub const LOG_DISCARD_NOT_SUPP: u64 = 1 << 1;
 pub const LOG_FLAGS_BUF_SIZE: usize = 128;
 
+#[derive(Derivative)]
+#[derivative(Debug)]
 pub struct Log {
+    #[derivative(Debug="ignore")]
     pub log_file: File,
+    #[derivative(Debug="ignore")]
     pub replay_file: File,
     pub flags: u64,
     pub nr_entries: u64,
@@ -155,14 +186,16 @@ pub fn entry_flags_to_str(flags: u64, buf: &mut String) {
     }
 }
 
-impl MemSize for LogWriteEntry {
-    fn mem_size() -> usize {
-        std::mem::size_of_val(&LogWriteEntry::default())
-    }
-}
+
 
 
 impl Log {
+
+    pub fn fsync_replay_file(&self) -> Result<()> {
+        self.replay_file.sync_all().map_err(|error| {
+            anyhow!("IO Error {}", error)
+        })
+    }
 
     fn discard_range(&mut self, start : u64, len : u64) -> i32 {
         let range : [u64;2] = [start, len];
@@ -235,6 +268,9 @@ impl Log {
             if ret > 0 {
                 bail!("Discard error")
             }
+
+            size -= len;
+            start += len;
         }
         Ok(())
     }
@@ -244,15 +280,16 @@ impl Log {
         let replay_file = OpenOptions::new().write(true).read(false).open(replay_file_path)?;
 
         let mut buf = [0_u8; 32];
-        io::read(&replay_file, &mut buf)?;
+        io::read(&log_file, &mut buf)?;
         let log_super = LogWriteSuper::from(buf);
 
-        if log_super.magic == WRITE_LOG_MAGIC {
+        println!("{:?}", log_super);
+        if log_super.magic != WRITE_LOG_MAGIC {
             bail!("Magic doesn't match")
         }
 
         // Seek to first log entry
-        let _ = log_file.seek(SeekFrom::Current(std::mem::size_of_val(&log_super) as i64)).map_err(|error| {
+        io::lseek(&log_file, (log_super.sector_size as i64 - std::mem::size_of_val(&log_super) as i64), Whence::SeekCur).map_err(|error| {
             anyhow!("Error seeking to first entry: {}", error)
         })?;
 
@@ -272,12 +309,13 @@ impl Log {
         let read_size = if read_data {
             self.sector_size as usize
         } else {
-            std::mem::size_of_val(&LogWriteEntry::default())
+            LogWriteEntry::mem_size()
         };
 
         let mut raw_log_entry = vec![0_u8; read_size];
 
         if self.cur_entry >= self.nr_entries {
+            println!("{:?}", self);
             return Ok(None);
         }
 
@@ -290,7 +328,9 @@ impl Log {
 
         let size = (entry.nr_sectors * self.sector_size as u64) as usize;
         if read_size < self.sector_size as usize {
-            self.log_file.seek(SeekFrom::Current(LogWriteEntry::mem_size() as i64))?;
+            println!("Seeking..");
+            io::lseek(&self.log_file, (self.sector_size as i64 - LogWriteEntry::mem_size() as i64), Whence::SeekCur)?;
+            //self.log_file.seek(SeekFrom::Current(LogWriteEntry::mem_size() as i64))?;
         }
 
         let mut flag_buf = String::new();
@@ -299,8 +339,8 @@ impl Log {
 
         println!("replaying {}: sector {}, size {}, flags {}({})", self.cur_entry - 1, entry.sector, size, flags, flag_buf);
 
-        if size > 0 {
-            return Ok(Some(entry));
+        if size < 0 {
+            return Ok(None);
         }
 
         if (flags & LOG_DISCARD_FLAG) > 0 {
@@ -312,17 +352,21 @@ impl Log {
         if buf.capacity() != size {
             bail!("Error allocating buffer {} entry {}", size, self.cur_entry - 1);
         }
+        unsafe  {
+            buf.set_len(size);
+        }
 
-        ret = io::read(&self.log_file, &mut buf)?;
+        ret = io::read(&self.log_file, &mut buf).unwrap();
         if ret != size as usize {
-            bail!("Error reading data: {}", ret)
+            println!("{:?}", buf);
+            bail!("Error reading data[X]: {}", ret)
         }
 
         let offset = entry.sector * self.sector_size as u64;
         ret = io::pwrite(&self.replay_file, buf.as_slice(), offset as i64)?;
         drop(buf);
         if ret != size as usize {
-            bail!("Error reading data: {}", ret)
+            bail!("Error reading data[Y]: {}", ret)
         }
         Ok(Some(entry))
     }

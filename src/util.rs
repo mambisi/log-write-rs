@@ -1,7 +1,11 @@
 use std::cmp::min;
 
 pub fn strncat(dest : &mut String, src : String, n : usize ) {
-    dest.push_str(&src[..n])
+    if n < src.len() {
+        dest.push_str(&src[..n])
+    }else{
+        dest.push_str(&src)
+    }
 }
 
 
